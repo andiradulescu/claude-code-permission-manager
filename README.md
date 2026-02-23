@@ -4,6 +4,8 @@ Claude Code's "Always Allow" button is broken. It doesn't persist choices, and p
 
 These hooks actually remember your choices.
 
+![Comparison: Claude's broken "Always Allow" (left) vs working hooks (right)](images/comparison.png)
+
 ## The Problem
 
 Claude Code has three long-standing issues with permissions:
