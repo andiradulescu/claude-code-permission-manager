@@ -264,6 +264,19 @@ is_segment_allowed() {
   seg_base="${seg_base//\'/}"
   seg_base="${seg_base##*/}"
 
+  # curl/wget can read OR upload. Deny auto-approve when upload/POST flags are
+  # present so a remote shell can't be used to exfiltrate data silently.
+  if [[ "$seg_base" == "curl" ]]; then
+    if [[ "$seg" =~ [[:space:]](-T|--upload-file|-d|--data|--data-binary|--data-raw|--data-urlencode|-F|--form|--post|-X[[:space:]]*(POST|PUT|PATCH|DELETE))([[:space:]=]|$) ]]; then
+      return 1
+    fi
+  fi
+  if [[ "$seg_base" == "wget" ]]; then
+    if [[ "$seg" =~ [[:space:]](--post-file|--post-data|--method=(POST|PUT|PATCH|DELETE)|--body-file|--body-data)([[:space:]=]|$) ]]; then
+      return 1
+    fi
+  fi
+
   # PM2: check subcommand against read-only list and user allowlist
   if [[ "$seg_base" == "pm2" ]]; then
     local pm2_sub
@@ -290,6 +303,26 @@ is_segment_allowed() {
   return 1
 }
 
+# Fail closed on shell metacharacters the segment splitter can't safely reason about.
+# Command substitution, process substitution, backticks, and standalone backgrounding
+# can smuggle commands past the per-segment allowlist check.
+if [[ "$remote_cmd_clean" == *'`'* ]] \
+  || [[ "$remote_cmd_clean" == *'$('* ]] \
+  || [[ "$remote_cmd_clean" == *'<('* ]] \
+  || [[ "$remote_cmd_clean" == *'>('* ]] \
+  || [[ "$remote_cmd_clean" =~ (^|[^\&])\&([^\&]|$) ]]; then
+  queue_suggestion "$remote_cmd_clean"
+  exit 0
+fi
+
+# Split on all command separators: && || ; |
+# Order matters: && and || must be replaced before single & and |
+segments="$remote_cmd_clean"
+segments="${segments//&&/$'\n'}"
+segments="${segments//||/$'\n'}"
+segments="${segments//|/$'\n'}"
+segments="${segments//;/$'\n'}"
+
 all_allowed=true
 failed_segments=()
 
@@ -301,7 +334,7 @@ while IFS= read -r segment; do
     segment="${segment%"${segment##*[![:space:]]}"}"
     [[ -n "$segment" ]] && failed_segments+=("$segment")
   fi
-done < <(echo "$remote_cmd_clean" | awk -F'&&|;' '{for(i=1;i<=NF;i++) print $i}')
+done <<< "$segments"
 
 if $all_allowed; then
   allow

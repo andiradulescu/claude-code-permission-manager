@@ -286,6 +286,26 @@ if [[ "$subcmd" == "shell" ]]; then
     return 1
   }
 
+  # Fail closed on shell metacharacters the segment splitter can't safely reason about.
+  # Command substitution, process substitution, backticks, and standalone backgrounding
+  # can smuggle commands past the per-segment allowlist check.
+  if [[ "$shell_cmd_clean" == *'`'* ]] \
+    || [[ "$shell_cmd_clean" == *'$('* ]] \
+    || [[ "$shell_cmd_clean" == *'<('* ]] \
+    || [[ "$shell_cmd_clean" == *'>('* ]] \
+    || [[ "$shell_cmd_clean" =~ (^|[^\&])\&([^\&]|$) ]]; then
+    queue_suggestion "shell $shell_cmd_clean"
+    exit 0
+  fi
+
+  # Split on all command separators: && || ; |
+  # Order matters: && and || must be replaced before single & and |
+  segments="$shell_cmd_clean"
+  segments="${segments//&&/$'\n'}"
+  segments="${segments//||/$'\n'}"
+  segments="${segments//|/$'\n'}"
+  segments="${segments//;/$'\n'}"
+
   all_allowed=true
   failed_segments=()
 
@@ -296,7 +316,7 @@ if [[ "$subcmd" == "shell" ]]; then
       segment="${segment%"${segment##*[![:space:]]}"}"
       [[ -n "$segment" ]] && failed_segments+=("$segment")
     fi
-  done < <(echo "$shell_cmd_clean" | awk -F'&&|;' '{for(i=1;i<=NF;i++) print $i}')
+  done <<< "$segments"
 
   if $all_allowed; then
     allow

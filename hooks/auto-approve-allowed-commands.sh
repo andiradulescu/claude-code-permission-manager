@@ -153,6 +153,65 @@ is_command_domain_allowed() {
   return 1
 }
 
+# Arg-exec sinks: commands whose arguments are themselves shell code or executable
+# names. Prefix allowlisting can't safely cover these because an innocent-looking
+# prefix like "git config" or "find ." hides argument-level code execution.
+# Example: `git config --global alias.x '!rm -rf ~'` matches "git config:*" but
+# installs a destructive alias that runs on the next git invocation.
+#
+# Returns 0 (match = deny auto-approve) if the command is a known sink.
+is_arg_exec_sink() {
+  local cmd="$1"
+
+  # find -exec / -execdir / -ok / -okdir all run argument commands
+  if [[ "$cmd" =~ [[:space:]](-exec|-execdir|-ok|-okdir)[[:space:]] ]]; then
+    return 0
+  fi
+
+  local first="${cmd%% *}"
+  first="${first##*/}"  # strip any path prefix
+
+  case "$first" in
+    # Unconditional sinks: these commands exist to run other commands
+    sudo|doas|su|eval|xargs|watch|parallel|nohup|setsid|timeout|gtimeout|time|chroot|unshare|nsenter)
+      return 0
+      ;;
+    # Interpreters with code-on-command-line flags
+    python|python2|python3|node|deno|bun|perl|ruby|php|lua|tclsh|Rscript|osascript)
+      [[ "$cmd" =~ [[:space:]](-c|-e|-r)([[:space:]]|$) ]] && return 0
+      ;;
+    # Shells with -c
+    bash|sh|zsh|ksh|fish|dash|ash|csh|tcsh)
+      [[ "$cmd" =~ [[:space:]]-c([[:space:]]|$) ]] && return 0
+      ;;
+  esac
+
+  # curl/wget with upload/POST flags are data-exfiltration primitives.
+  # Deny auto-approve so the user sees a prompt even if they allowlisted curl.
+  if [[ "$first" == "curl" ]]; then
+    if [[ "$cmd" =~ [[:space:]](-T|--upload-file|-d|--data|--data-binary|--data-raw|--data-urlencode|-F|--form|--post|-X[[:space:]]*(POST|PUT|PATCH|DELETE))([[:space:]=]|$) ]]; then
+      return 0
+    fi
+  fi
+  if [[ "$first" == "wget" ]]; then
+    if [[ "$cmd" =~ [[:space:]](--post-file|--post-data|--method=(POST|PUT|PATCH|DELETE)|--body-file|--body-data)([[:space:]=]|$) ]]; then
+      return 0
+    fi
+  fi
+
+  # git subcommands that set config, run hooks, or exec per-commit commands
+  if [[ "$first" == "git" ]]; then
+    [[ "$cmd" =~ ^git[[:space:]]+config([[:space:]]|$) ]] && return 0
+    [[ "$cmd" =~ ^git[[:space:]]+-c[[:space:]] ]] && return 0
+    [[ "$cmd" =~ ^git[[:space:]]+submodule[[:space:]]+foreach([[:space:]]|$) ]] && return 0
+    [[ "$cmd" =~ ^git[[:space:]]+bisect[[:space:]]+run([[:space:]]|$) ]] && return 0
+    [[ "$cmd" =~ ^git[[:space:]]+rebase[[:space:]].*(--exec|[[:space:]]-x)([[:space:]]|$) ]] && return 0
+    [[ "$cmd" =~ ^git[[:space:]]+filter-branch([[:space:]]|$) ]] && return 0
+  fi
+
+  return 1
+}
+
 # Check if a command matches any allowed prefix
 # full_command: the extracted command with all args (e.g., "git log --oneline")
 # allowed_prefixes: array of allowed prefixes from settings (e.g., "git log", "grep")
@@ -160,14 +219,31 @@ is_command_allowed() {
   local full_command="$1"
   local -n prefixes_ref=$2  # nameref to array
 
+  # Reject arg-exec sinks before prefix matching. Even if the user allowlisted
+  # e.g. "git config:*", auto-approving it is unsafe because the arguments
+  # themselves execute code. Fall through to the normal permission prompt.
+  if is_arg_exec_sink "$full_command"; then
+    debug "BLOCKED: '$full_command' (arg-exec sink, prefix match skipped)"
+    return 1
+  fi
+
   for allowed in "${prefixes_ref[@]}"; do
     # Check if command starts with the allowed prefix
     # "git log --oneline" matches "git log" and "git"
     # "grep -E pattern" matches "grep"
     # "python3 .claude/skills/foo/bar.py" matches "python3 .claude/skills:*"
-    if [[ "$full_command" == "$allowed" ]] || [[ "$full_command" == "$allowed "* ]] || [[ "$full_command" == "$allowed/"* ]]; then
+    if [[ "$full_command" == "$allowed" ]] || [[ "$full_command" == "$allowed "* ]]; then
       debug "ALLOWED: '$full_command' (matches '$allowed')"
       return 0
+    fi
+    if [[ "$full_command" == "$allowed/"* ]]; then
+      # Path-prefix match: reject .. traversal in the suffix
+      local suffix="${full_command#"$allowed/"}"
+      if ! [[ "$suffix" =~ (^|/)\.\.(/|[[:space:]]|$) ]]; then
+        debug "ALLOWED: '$full_command' (path prefix matches '$allowed')"
+        return 0
+      fi
+      debug "BLOCKED: '$full_command' (path prefix '$allowed' but suffix contains ..)"
     fi
   done
 
@@ -538,10 +614,11 @@ get_shell_c_inner() {
     stripped="${BASH_REMATCH[1]}"
   fi
 
-  # Now match: bash -c '...' or sh -c '...'
-  if [[ "$stripped" =~ ^(bash|sh)[[:space:]]+-c[[:space:]]*[\'\"](.*)[\'\"]$ ]]; then
+  # Match: bash -c 'single-quoted' or bash -c "double-quoted"
+  # Quotes must be balanced (matched pairs) to prevent quote-mixing tricks.
+  if [[ "$stripped" =~ ^(bash|sh)[[:space:]]+-c[[:space:]]*\'([^\']*)\'$ ]]; then
     echo "${BASH_REMATCH[2]}"
-  elif [[ "$stripped" =~ ^(bash|sh)[[:space:]]+-c[\'\"](.*)[\'\"]$ ]]; then
+  elif [[ "$stripped" =~ ^(bash|sh)[[:space:]]+-c[[:space:]]*\"(.*)\"$ ]]; then
     echo "${BASH_REMATCH[2]}"
   fi
 }
